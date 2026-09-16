@@ -1,4 +1,4 @@
-# Home-services-provider-platform-Proyojon-sProyojon
+# Home-services-provider-platform-Proyojon-Proyojon
 
 > A trusted home-services marketplace for residents and service providers in Dhaka.
 
