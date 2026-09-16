@@ -8,6 +8,7 @@ const CustomerSchema = new mongoose.Schema({
   role: { type: String, default: 'customer' },
   phone: { type: String, default: '' },
   zone: { type: String, default: 'Gulshan' },
+  status: { type: String, enum: ['active', 'suspended'], default: 'active' },
   totalSpent: { type: Number, default: 0 },
   joinedAt: { type: Date, default: Date.now }
 });
