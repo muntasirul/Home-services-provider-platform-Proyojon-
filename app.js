@@ -50,7 +50,7 @@ const DB = {
   clearSession() { this.remove('session'); },
 
   // Persist last active page (not auth)
-  getLastPage() { return this.get('lastPage') || 'landing'; },
+  getLastPage() { return this.get('lastPage') || 'customer'; },
   setLastPage(page) { return this.set('lastPage', page); },
 
   // Memory Cache for MongoDB Collections
@@ -61,36 +61,37 @@ const DB = {
   getServices() { return _state.services || []; },
 
   async sync() {
-    try {
-      const [areasRes, workersRes, bookingsRes, servicesRes, reviewsRes, customersRes, complaintsRes] = await Promise.all([
-        fetch('/api/areas'),
-        fetch('/api/workers'),
-        fetch('/api/bookings'),
-        fetch('/api/services'),
-        fetch('/api/reviews'),
-        fetch('/api/customers').catch(() => null),
-        fetch('/api/complaints').catch(() => null)
-      ]);
-      _state.areas = await areasRes.json();
-      _state.workers = await workersRes.json();
-      _state.bookings = await bookingsRes.json();
-      _state.services = await servicesRes.json();
-      _state.reviews = await reviewsRes.json();
-      
-      let customers = [];
-      if (customersRes && customersRes.ok) {
-        customers = await customersRes.json();
+    const loadCollection = async (url) => {
+      try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`${url} returned HTTP ${response.status}`);
+        const collection = await response.json();
+        if (!Array.isArray(collection)) throw new TypeError(`${url} did not return a collection`);
+        return collection;
+      } catch (err) {
+        console.error(`Failed to load ${url}:`, err);
+        return null;
       }
-      _state.users = Array.isArray(customers) && customers.length ? [...customers, ..._state.workers] : [..._state.workers];
+    };
 
-      if (complaintsRes && complaintsRes.ok) {
-        _state.complaints = await complaintsRes.json();
-      } else {
-        _state.complaints = [];
-      }
-    } catch (err) {
-      console.error('Failed to sync database collections:', err);
-    }
+    const [areas, workers, bookings, services, reviews, customers, complaints] = await Promise.all([
+      loadCollection('/api/areas'),
+      loadCollection('/api/workers'),
+      loadCollection('/api/bookings'),
+      loadCollection('/api/services'),
+      loadCollection('/api/reviews'),
+      loadCollection('/api/customers'),
+      loadCollection('/api/complaints')
+    ]);
+
+    _state.areas = areas || [];
+    _state.workers = workers || [];
+    _state.bookings = bookings || [];
+    _state.services = services || [];
+    _state.serviceDataAvailable = services !== null;
+    _state.reviews = reviews || [];
+    _state.users = [...(customers || []), ..._state.workers];
+    _state.complaints = complaints || [];
   }
 };
 
@@ -136,9 +137,12 @@ const TIMELINE = [
 // ─── STATE ─────────────────────────────────────────────────────────────────────
 
 let _state = {
-  currentPage: 'auth',
+  currentPage: 'customer',
   authMode: 'login',
   authRole: 'customer',
+  authReturnPage: null,
+  authReturnToCart: false,
+  authSourcePage: 'customer',
   catFilter: 'all',
   searchQuery: '',
   zone: 'All',
@@ -149,6 +153,7 @@ let _state = {
   bookings: [],
   areas: [],
   services: [],
+  serviceDataAvailable: true,
   reviews: [],
   userLocation: {
     lat: 23.7925,
@@ -201,7 +206,13 @@ function attachReveal() {
 const App = {
   // Switch between app pages (not auth)
   async goPage(pageId) {
-    await DB.sync(); // Refresh collections from server before rendering any page
+    const session = DB.getSession();
+    if ((pageId === 'mod' && session?.role !== 'moderator') ||
+        (pageId === 'provider' && session?.role !== 'provider') ||
+        (pageId === 'combos' && session && session.role !== 'customer')) {
+      showToast('This page is not available for your account', 'error');
+      pageId = 'customer';
+    }
 
     // Hide all app pages
     document.querySelectorAll('#app-wrapper .page').forEach(p => p.classList.remove('active'));
@@ -236,13 +247,49 @@ const App = {
     setTimeout(attachReveal, 100);
   },
 
+  showGuestPrompt(elementId, title, message) {
+    const target = document.getElementById(elementId);
+    if (!target) return;
+    target.innerHTML = `
+      <div class="bg-white border border-orange-100 rounded-2xl p-6 text-center">
+        <h2 class="font-syne font-bold text-xl">${title}</h2>
+        <p class="text-sm text-gray-500 mt-2">${message}</p>
+        <button type="button" onclick="Auth.openLogin()"
+          class="mt-4 bg-[#0d0e11] text-white px-5 py-2.5 rounded-xl text-xs font-bold uppercase tracking-wider hover:bg-orange-600 transition">
+          Login / Sign up
+        </button>
+      </div>
+    `;
+    target.classList.remove('hidden');
+  },
+
   // Show the auth screen (hide app)
   showAuth() {
     document.getElementById('page-auth').style.display = 'flex';
     document.getElementById('main-nav').style.display = 'none';
     document.getElementById('app-wrapper').style.display = 'none';
+    document.getElementById('ai-chat-btn').style.display = 'none';
+    document.getElementById('ai-chat-box').style.display = 'none';
     _state.currentPage = 'auth';
     setTimeout(attachReveal, 100);
+  },
+
+  // Show public pages and navigation to signed-out visitors
+  showGuest() {
+    document.getElementById('page-auth').style.display = 'none';
+    document.getElementById('main-nav').style.display = 'block';
+    document.getElementById('app-wrapper').style.display = 'block';
+    document.getElementById('login-btn').style.display = 'flex';
+    document.getElementById('logout-btn').style.display = 'none';
+
+    document.getElementById('bnav-mod').classList.add('hidden');
+    document.getElementById('bnav-provider').classList.add('hidden');
+    document.getElementById('bnav-messages').classList.remove('hidden');
+    document.getElementById('bnav-complaints').classList.remove('hidden');
+    document.getElementById('bnav-combos').classList.remove('hidden');
+    document.getElementById('ai-chat-btn').style.display = 'flex';
+    document.getElementById('ai-chat-box').style.display = '';
+    Notifications.init();
   },
 
   // Show the app (hide auth)
@@ -250,6 +297,7 @@ const App = {
     document.getElementById('page-auth').style.display = 'none';
     document.getElementById('main-nav').style.display = 'block';
     document.getElementById('app-wrapper').style.display = 'block';
+    document.getElementById('login-btn').style.display = 'none';
     document.getElementById('logout-btn').style.display = 'flex';
 
     if (session.role === 'moderator') {
@@ -284,26 +332,35 @@ const App = {
   },
 
   async init() {
+    const session = DB.getSession();
+    if (!session) App.showGuest();
+
     await DB.sync(); // Initial server fetch
     Notifications.init();
-    const session = DB.getSession();
     if (session) {
       // Already logged in — restore the last page
       App.showApp(session);
-      const lastPage = DB.getLastPage();
+      const savedPage = DB.getLastPage();
+      const lastPage = session.role === 'customer' && ['landing', 'home'].includes(savedPage) ? 'customer' : savedPage;
 
       // Guard for pages
       if (lastPage === 'mod' && session.role !== 'moderator') {
-        App.goPage('landing');
+        App.goPage('customer');
       } else if (lastPage === 'provider' && session.role !== 'provider') {
-        App.goPage('landing');
+        App.goPage('customer');
       } else if (lastPage === 'combos' && session.role !== 'customer') {
-        App.goPage('landing');
+        App.goPage('customer');
       } else {
         App.goPage(lastPage);
       }
     } else {
-      App.showAuth();
+      if (_state.currentPage === 'auth') {
+        App.showAuth();
+        return;
+      }
+
+      App.showGuest();
+      await App.goPage(_state.currentPage || 'customer');
     }
   },
 };
@@ -311,6 +368,39 @@ const App = {
 // ─── AUTH ──────────────────────────────────────────────────────────────────────
 
 const Auth = {
+  openLogin() {
+    if (_state.authMode === 'signup') Auth.toggleMode();
+    Auth.setRole('customer');
+    _state.authSourcePage = _state.currentPage === 'auth' ? 'customer' : _state.currentPage;
+    _state.authReturnPage = _state.authSourcePage;
+    _state.authReturnToCart = false;
+    App.showAuth();
+  },
+
+  async backToBrowsing() {
+    const sourcePage = _state.authSourcePage;
+    const returnToCart = _state.authReturnToCart;
+    _state.authReturnPage = null;
+    _state.authReturnToCart = false;
+    App.showGuest();
+    await App.goPage(sourcePage && sourcePage !== 'auth' ? sourcePage : 'customer');
+    if (returnToCart) Cart.open();
+  },
+
+  async afterAuthentication(user) {
+    App.showApp(user);
+    const returnPage = _state.authReturnPage;
+    const returnToCart = _state.authReturnToCart;
+    _state.authReturnPage = null;
+    _state.authReturnToCart = false;
+
+    const defaultPage = user.role === 'provider' ? 'provider'
+      : user.role === 'moderator' ? 'mod'
+        : 'customer';
+    await App.goPage(returnPage || defaultPage);
+    if (returnToCart) Cart.open();
+  },
+
   setRole(role) {
     _state.authRole = role;
     document.getElementById('role-customer').classList.toggle('active', role === 'customer');
@@ -420,14 +510,7 @@ const Auth = {
 
         showToast(`Welcome to Proyojon, ${name}!`);
         setTimeout(() => {
-          App.showApp(data);
-          if (data.role === 'provider') {
-            App.goPage('provider');
-          } else if (data.role === 'moderator') {
-            App.goPage('mod');
-          } else {
-            App.goPage('landing');
-          }
+          Auth.afterAuthentication(data);
         }, 600);
       } catch (err) {
         Auth.showError('Network error. Please try again.');
@@ -449,14 +532,7 @@ const Auth = {
 
         showToast(`Welcome back, ${data.name}!`);
         setTimeout(() => {
-          App.showApp(data);
-          if (data.role === 'provider') {
-            App.goPage('provider');
-          } else if (data.role === 'moderator') {
-            App.goPage('mod');
-          } else {
-            App.goPage('landing');
-          }
+          Auth.afterAuthentication(data);
         }, 600);
       } catch (err) {
         Auth.showError('Network error. Please try again.');
@@ -472,7 +548,7 @@ const Auth = {
 
   logout() {
     DB.clearSession();
-    DB.setLastPage('landing');
+    DB.setLastPage('customer');
     _state.cartItems = [];
     Cart.updateUI();
 
@@ -484,7 +560,10 @@ const Auth = {
     setTimeout(() => {
       // Hide all app pages
       document.querySelectorAll('#app-wrapper .page').forEach(p => p.classList.remove('active'));
-      App.showAuth();
+      _state.authReturnPage = null;
+      _state.authReturnToCart = false;
+      App.showGuest();
+      App.goPage('customer');
     }, 600);
   },
 };
@@ -1117,6 +1196,12 @@ const Cart = {
     }
   },
 
+  open() {
+    const panel = document.getElementById('cart-panel');
+    if (!panel.classList.contains('open')) this.toggle();
+    else this.updateMinSchedule();
+  },
+
   handleOverlayClick(e) {
     if (e.target === document.getElementById('cart-panel')) this.toggle();
   },
@@ -1179,7 +1264,14 @@ const Cart = {
   async checkout() {
     if (!_state.cartItems.length) { showToast('Your cart is empty', 'error'); return; }
     const session = DB.getSession();
-    if (!session) { showToast('Please login first', 'error'); return; }
+    if (!session) {
+      _state.authSourcePage = _state.currentPage;
+      _state.authReturnPage = 'landing';
+      _state.authReturnToCart = true;
+      Cart.open();
+      App.showAuth();
+      return;
+    }
 
     const scheduleInput = document.getElementById('cart-schedule');
     const scheduledFor = scheduleInput ? scheduleInput.value : '';
@@ -1299,6 +1391,9 @@ const Services = {
 
     if (!filtered.length) {
       listEl.innerHTML = '';
+      noEl.textContent = _state.serviceDataAvailable
+        ? 'No services found'
+        : 'Service catalog is unavailable. Please reconnect the database and reload.';
       noEl.classList.remove('hidden');
       return;
     }
@@ -1359,7 +1454,15 @@ const Services = {
 const Landing = {
   render() {
     const featured = DB.getServices().slice(0, 6);
-    document.getElementById('featured-services').innerHTML = featured.map(s => `
+    const featuredServices = document.getElementById('featured-services');
+    if (!featured.length) {
+      featuredServices.innerHTML = `<p class="text-gray-500 text-sm">${_state.serviceDataAvailable
+        ? 'No services are available yet.'
+        : 'Service catalog unavailable. Please reconnect the database and reload.'}</p>`;
+      return;
+    }
+
+    featuredServices.innerHTML = featured.map(s => `
       <div class="svc-card reveal">
         <div class="flex justify-between mb-4">
           <span class="text-4xl">${s.icon}</span>
@@ -1509,7 +1612,11 @@ const Bookings = {
 
   render() {
     const session = DB.getSession();
-    if (!session) return;
+    if (!session) {
+      App.showGuestPrompt('bookings-list', 'Your orders are waiting here',
+        'Log in to view and manage your bookings.');
+      return;
+    }
 
     const all = DB.getBookings().filter(b => b.userId === session.id).reverse();
     this.renderList(all);
@@ -1662,7 +1769,22 @@ const Bookings = {
 const Profile = {
   load() {
     const user = DB.getSession();
-    if (!user) return;
+    const guestPrompt = document.getElementById('profile-guest-prompt');
+    const accountDetails = document.getElementById('profile-account-details');
+    if (!user) {
+      document.getElementById('profile-name').textContent = 'Guest User';
+      document.getElementById('profile-initial').textContent = '?';
+      document.getElementById('profile-role-display').textContent = 'Sign in to manage your profile';
+      document.getElementById('profile-email-display').textContent = '';
+      App.showGuestPrompt('profile-guest-prompt', 'Your profile',
+        'Log in to view and edit your account details.');
+      guestPrompt.classList.remove('hidden');
+      accountDetails.classList.add('hidden');
+      return;
+    }
+
+    guestPrompt.classList.add('hidden');
+    accountDetails.classList.remove('hidden');
 
     document.getElementById('profile-name').textContent = user.name;
     document.getElementById('profile-initial').textContent = initials(user.name);
@@ -2731,8 +2853,15 @@ const MsgPanel = {
   // Called when navigating to #page-messages
   load() {
     const session = DB.getSession();
-    if (!session) return;
+    if (!session) {
+      App.showGuestPrompt('msg-guest-prompt', 'Sign in to view your messages',
+        'Your service conversations will appear here after you log in.');
+      document.getElementById('msg-chat-view').style.display = 'none';
+      document.getElementById('msg-empty-state').style.display = 'flex';
+      return;
+    }
 
+    document.getElementById('msg-guest-prompt').classList.add('hidden');
     const bookings = _state.bookings || [];
     const role = session.role;
 
@@ -3149,8 +3278,7 @@ const Combos = {
 
   addToCart(comboId) {
     const session = DB.getSession();
-    if (!session) { showToast('Please login first', 'error'); return; }
-    if (session.role !== 'customer') { showToast('Only customers can add to cart', 'error'); return; }
+    if (session && session.role !== 'customer') { showToast('Only customers can add to cart', 'error'); return; }
 
     const combo = Combos.list.find(c => c.id === comboId);
     if (!combo) return;
@@ -3225,7 +3353,15 @@ const Complaints = {
 
   async load() {
     const session = DB.getSession();
-    if (!session) return;
+    if (!session) {
+      document.getElementById('complaints-mod-view').classList.add('hidden');
+      document.getElementById('complaints-user-view').classList.add('hidden');
+      App.showGuestPrompt('complaints-guest-prompt', 'Support for your orders',
+        'Log in to view your orders and contact support.');
+      return;
+    }
+
+    document.getElementById('complaints-guest-prompt').classList.add('hidden');
     await DB.sync();
 
     const role = session.role;
@@ -4275,4 +4411,3 @@ document.addEventListener('DOMContentLoaded', () => {
   AIChat.init();
   MsgPanel.init();
 });
-
